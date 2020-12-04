@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/types"
 	"github.com/miekg/dns"
 )
@@ -87,6 +87,7 @@ type resolver struct {
 	listenAddress string
 	proxyDNS      bool
 	resolverKey   string
+	startCh       chan struct{}
 }
 
 func init() {
@@ -101,6 +102,7 @@ func NewResolver(address string, proxyDNS bool, resolverKey string, backend DNSB
 		listenAddress: address,
 		resolverKey:   resolverKey,
 		err:           fmt.Errorf("setup not done yet"),
+		startCh:       make(chan struct{}, 1),
 	}
 }
 
@@ -136,6 +138,9 @@ func (r *resolver) SetupFunc(port int) func() {
 }
 
 func (r *resolver) Start() error {
+	r.startCh <- struct{}{}
+	defer func() { <-r.startCh }()
+
 	// make sure the resolver has been setup before starting
 	if r.err != nil {
 		return r.err
@@ -160,6 +165,9 @@ func (r *resolver) Start() error {
 }
 
 func (r *resolver) Stop() {
+	r.startCh <- struct{}{}
+	defer func() { <-r.startCh }()
+
 	if r.server != nil {
 		r.server.Shutdown()
 	}
@@ -219,7 +227,7 @@ func (r *resolver) handleIPQuery(name string, query *dns.Msg, ipType int) (*dns.
 
 	if addr == nil && ipv6Miss {
 		// Send a reply without any Answer sections
-		log.Debugf("Lookup name %s present without IPv6 address", name)
+		logrus.Debugf("Lookup name %s present without IPv6 address", name)
 		resp := createRespMsg(query)
 		return resp, nil
 	}
@@ -227,7 +235,7 @@ func (r *resolver) handleIPQuery(name string, query *dns.Msg, ipType int) (*dns.
 		return nil, nil
 	}
 
-	log.Debugf("Lookup for %s: IP %v", name, addr)
+	logrus.Debugf("Lookup for %s: IP %v", name, addr)
 
 	resp := createRespMsg(query)
 	if len(addr) > 1 {
@@ -268,7 +276,7 @@ func (r *resolver) handlePTRQuery(ptr string, query *dns.Msg) (*dns.Msg, error) 
 		return nil, nil
 	}
 
-	log.Debugf("Lookup for IP %s: name %s", parts[0], host)
+	logrus.Debugf("Lookup for IP %s: name %s", parts[0], host)
 	fqdn := dns.Fqdn(host)
 
 	resp := new(dns.Msg)
@@ -352,7 +360,7 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 	}
 
 	if err != nil {
-		log.Error(err)
+		logrus.Error(err)
 		return
 	}
 
@@ -410,11 +418,15 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 			}
 
 			execErr := r.backend.ExecFunc(extConnect)
-			if execErr != nil || err != nil {
-				log.Debugf("Connect failed, %s", err)
+			if execErr != nil {
+				logrus.Warn(execErr)
 				continue
 			}
-			log.Debugf("Query %s[%d] from %s, forwarding to %s:%s", name, query.Question[0].Qtype,
+			if err != nil {
+				logrus.Warnf("Connect failed: %s", err)
+				continue
+			}
+			logrus.Debugf("Query %s[%d] from %s, forwarding to %s:%s", name, query.Question[0].Qtype,
 				extConn.LocalAddr().String(), proto, extDNS.ipStr)
 
 			// Timeout has to be set for every IO operation.
@@ -430,7 +442,7 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 				old := r.tStamp
 				r.tStamp = time.Now()
 				if r.tStamp.Sub(old) > logInterval {
-					log.Errorf("More than %v concurrent queries from %s", maxConcurrent, extConn.LocalAddr().String())
+					logrus.Errorf("More than %v concurrent queries from %s", maxConcurrent, extConn.LocalAddr().String())
 				}
 				continue
 			}
@@ -438,7 +450,7 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 			err = co.WriteMsg(query)
 			if err != nil {
 				r.forwardQueryEnd()
-				log.Debugf("Send to DNS server failed, %s", err)
+				logrus.Debugf("Send to DNS server failed, %s", err)
 				continue
 			}
 
@@ -447,11 +459,36 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 			// client can retry over TCP
 			if err != nil && err != dns.ErrTruncated {
 				r.forwardQueryEnd()
-				log.Debugf("Read from DNS server failed, %s", err)
+				logrus.Debugf("Read from DNS server failed, %s", err)
 				continue
 			}
 
 			r.forwardQueryEnd()
+
+			if resp == nil {
+				logrus.Debugf("[resolver] external DNS %s:%s returned empty response for %q", proto, extDNS.ipStr, name)
+				break
+			}
+			switch resp.Rcode {
+			case dns.RcodeServerFailure, dns.RcodeRefused:
+				// Server returned FAILURE: continue with the next external DNS server
+				// Server returned REFUSED: this can be a transitional status, so continue with the next external DNS server
+				logrus.Debugf("[resolver] hyxtest>> external DNS %s:%s responded with %s for %q", proto, extDNS.ipStr, statusString(resp.Rcode), name)
+				continue
+			case dns.RcodeNameError:
+				// Server returned NXDOMAIN. Stop resolution if it's an authoritative answer (see RFC 8020: https://tools.ietf.org/html/rfc8020#section-2)
+				logrus.Debugf("[resolver] hyxtest>> external DNS %s:%s responded with %s for %q", proto, extDNS.ipStr, statusString(resp.Rcode), name)
+				if resp.Authoritative {
+					break
+				}
+				continue
+			case dns.RcodeSuccess:
+				// All is well
+			default:
+				// Server gave some error. Log the error, and continue with the next external DNS server
+				logrus.Debugf("[resolver] external DNS %s:%s responded with %s (code %d) for %q", proto, extDNS.ipStr, statusString(resp.Rcode), resp.Rcode, name)
+				continue
+			}
 
 			resp.Compress = true
 			break
@@ -462,8 +499,15 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 	}
 
 	if err = w.WriteMsg(resp); err != nil {
-		log.Errorf("error writing resolver resp, %s", err)
+		logrus.Errorf("error writing resolver resp, %s", err)
 	}
+}
+
+func statusString(responseCode int) string {
+	if s, ok := dns.RcodeToString[responseCode]; ok {
+		return s
+	}
+	return "UNKNOWN"
 }
 
 func (r *resolver) forwardQueryStart() bool {
@@ -483,7 +527,7 @@ func (r *resolver) forwardQueryEnd() {
 	defer r.queryLock.Unlock()
 
 	if r.count == 0 {
-		log.Errorf("Invalid concurrent query count")
+		logrus.Error("Invalid concurrent query count")
 	} else {
 		r.count--
 	}
